@@ -5,15 +5,16 @@ Created on Sep 6, 2013
 '''
 from sphinxapi import *
 import MySQLdb
-import zlib
+import decimal
+import hashlib
+import inspect
 import json
+import login_info
+import memcache
 import pprint
 import re
 import time
-import memcache
-import hashlib
-import inspect
-import login_info
+import zlib
 c = "search"
 limit = 100
 query = ""
@@ -76,12 +77,31 @@ class Query(object):
             self.getTopSubmissions()
         elif operation == 'activethreads':
             self.getMostActiveThreads()
+        elif operation == 'subreddits':
+            self.getSubredditsLike()
+        elif operation == 'subreddit_by_minute':
+            self.subredditMinutely()
         else:
             self.search()
 
     def __str__(self):
         return json.dumps(self.output)
     
+    def _cache(f):
+        def replacement(self):
+            if not self.cacheCheck():
+                f(self)
+                self.cache()
+            return self.output()
+        return replacement
+    def _secondcache(f):
+        def replacement(self):
+            if not self.cacheCheck():
+                f(self)
+                self.cache(1)
+            return self.output()
+        return replacement 
+        
     def sphinxInit(self):
         """
         Connects to Sphinx and sets various modes.
@@ -107,6 +127,7 @@ class Query(object):
         """
         Connects to the MySQL database. 
         """
+        # conv[246] = int  # Hack to convert decimals to ints.
         self.con = MySQLdb.connect('localhost', self.user, self.password, 'reddit', charset='utf8')
         self.cur = self.con.cursor(MySQLdb.cursors.DictCursor)
         
@@ -148,13 +169,20 @@ class Query(object):
             return True
         return False
    
-    def cache(self):
+    def cache(self, time=None):
         """
         Caches a result. Time is based on the amount of time the search took.
         """
-        time = int(3600 * (self.search_time / 5))
-        self.json_output["debug"]["cache_time"] = 300 if time < 300 else time
+        if not time:
+            time = int(3600 * (self.search_time / 5))
+            time = 300 if time < 300 else time
+        self.json_output["debug"]["cache_time"] = time
         self.memcache.set(self.key, self.json_output, time)
+        
+    def decimal_default(self, obj):
+        if isinstance(obj, decimal.Decimal):
+            return int(obj)
+        raise TypeError
         
     def output(self):
         """
@@ -163,6 +191,13 @@ class Query(object):
         self.json_output['debug']['debug_time'] = time.clock() - self.start_time
         return json.dumps(self.json_output)
     
+
+    def getSubredditIDs(self):
+        self.dbquery = "SELECT id FROM _subreddits WHERE subreddit IN (%s)" % ','.join(["'%s'" % x for x in self.subreddit.split(',')])
+        self.cur.execute(self.dbquery)
+        subreddits = [int(x['id']) for x in self.cur.fetchall()]
+        return subreddits
+
     def getSubreddits(self, id, table):
         """
         :param id: The ID column to match against.
@@ -175,15 +210,12 @@ class Query(object):
         subreddits = []
         if self.query != '':
             if self.subreddit != '':
-                self.dbquery = "SELECT id FROM _subreddits WHERE subreddit IN (%s)" % ','.join(["'%s'" % x for x in self.subreddit.split(',')])
-                self.cur.execute(self.dbquery)
-                subreddits = [int(x[0]) for x in self.cur.fetchall()]
+                subreddits = self.getSubredditIDs()
                 self.cl.SetFilter("subreddit_id", self.sr_ids)
             self.sphinxResult()
             self.matches = self.result['matches']
         else:
             limit = " LIMIT %s" % self.limit
-            
             addon = " WHERE subreddit_id IN (%s)" % ','.join(["'%s'" % x for x in subreddits]) if len(subreddits) > 0 else '' 
             addon = addon + limit
             query = "SELECT %s FROM %s%s" % (id, table, addon)
@@ -191,46 +223,52 @@ class Query(object):
             rows = self.cur.fetchallDict()
             self.matches.extend(rows)
 
+
+    def ungzip(self, row):
+        return self.json_output['data'].append(json.loads(zlib.decompress(row['json'])))
+    
+    @_cache
     def search(self):
         """
         Search operation. Returns all submissions that match the query.
         """
         self.index = 'main'
-        if not self.cacheCheck():
-            if self.query == "ALL":
-                self.query = ""
-            self.setLimit(100)
-            self.getSubreddits('id', 'submissions_index')
+        sqlquery = "SELECT id,json FROM submissions WHERE id IN (%s)"
 
-            ids = ','.join([str(int(x['id'])) for x in self.matches])
-            query = "SELECT id,json FROM submissions WHERE id IN (%s)" % (ids)
-            print ids
-            results = self.cur.execute(query)
-            rows = self.cur.fetchallDict()
-            for row in rows:
-                self.json_output['data'].append(json.loads(zlib.decompress(row['json'])))
-        self.cache()
-        return self.output()
-                    
+        if self.query == "ALL":
+            self.query = ""
+        self.setLimit(100)
+        self.getSubreddits('id', 'submissions_index')
+
+        ids = ','.join([str(int(x['id'])) for x in self.matches])
+        rows = self.sqlQuery(sqlquery, ids)
+        for row in rows:
+            self.ungzip(row)
+
+
+    def sqlQuery(self, query, *args):
+           query = query % args
+           results = self.cur.execute(query)
+           rows = self.cur.fetchallDict()
+           return rows
+    
+    @_cache
     def searchComments(self):
         """
         Search comments operation. Returns all comments that match the query.
         """
-        
         self.index = 'comments'
-        
-        if not self.cacheCheck():
-            self.setLimit(500)
-            self.getSubreddits('comment_id', 'comments_index')
-            ids = ','.join([str(int(x['comment_id'])) for x in self.matches])
-            query = "SELECT json FROM comments WHERE comment_id IN (%s)" % (ids)
-            results = self.cur.execute(query)
-            rows = self.cur.fetchallDict()
-            for row in rows:
-                self.json_output['data'].append(json.loads(zlib.decompress(row["json"])))
+        self.setLimit(500)
+        self.getSubreddits('comment_id', 'comments_index')
+        ids = ','.join([str(int(x['comment_id'])) for x in self.matches])
+        query = "SELECT json FROM comments WHERE comment_id IN (%s)" % (ids)
+        results = self.cur.execute(query)
+        rows = self.cur.fetchallDict()
+        for row in rows:
+            self.ungzip(row)
         self.cache()
         return self.output()
-        
+    
     def setLimit(self, limit):
         """
         Sets a limit based.
@@ -281,6 +319,30 @@ class Query(object):
             row = self.cur.fetchone()
             self.json_output['data'].append(json.loads(zlib.decompress(row[1])))
         self.cache()
-        self.json_output = self.json_output
         return self.output()
 
+    def getSubredditsLike(self):
+        self.setLimit(1000)
+        query = "SELECT subreddit,id FROM _subreddits WHERE subreddit LIKE '%s%%' LIMIT %s" % (self.query, self.limit)
+        print query
+        results = self.cur.execute(query)
+        rows = self.cur.fetchallDict()
+        self.json_output['data'].extend(rows)
+        return self.output
+    
+    @_secondcache
+    def subredditMinutely(self):
+        subreddits = self.getSubredditIDs()
+        query = """
+                SELECT date, cast(sum(comment_count) as int) AS count
+                FROM  `_subreddits_minute`
+                %s 
+                GROUP BY date
+                ORDER BY date DESC
+                LIMIT %s 
+                """
+        wherestring = ""
+        if len(subreddits) > 0:
+            wherestring = "WHERE subreddit_id IN (%s)" % ','.join([str(x) for x in subreddits])   
+        self.json_output['data'].extend(self.sqlQuery(query, wherestring, self.limit))
+        
