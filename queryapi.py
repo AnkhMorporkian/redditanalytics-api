@@ -163,6 +163,21 @@ class Query(object):
         else:
             self.limit = self.limit
 
+    def getMostActiveThreads(self):
+        self.dbquery = """
+        SELECT count(*) as count, subreddit, title,LOWER(CONV(link_id,10,36)) as link_id
+        FROM comments_index, _subreddits, _titles
+        WHERE date > UNIX_TIMESTAMP(now()) - %s AND
+        _titles.id = link_id AND
+        _subreddits.id = subreddit_id
+        GROUP BY comments_index.link_id
+        ORDER BY count(*) DESC
+        LIMIT %s
+        """ % (300,25)
+        self.cur.execute(self.dbquery)
+        self.json_output['data'] += self.cur.fetchallDict()
+        print json.dumps(self.json_output)
+
     def getTopSubmissions(self):
         self.index = "main"
         self.limit = 25
