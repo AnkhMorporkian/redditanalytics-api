@@ -55,7 +55,7 @@ class Query(object):
             
     def connectMySQL(self):
         self.con = MySQLdb.connect('localhost', self.user, self.password, 'reddit')
-        self.cur = self.con.cursor()
+        self.cur = self.con.cursor(MySQLdb.cursors.DictCursor)
         
     def sphinxConnect(self):
         self.cl.SetLimits(0, self.limit)
@@ -94,24 +94,7 @@ class Query(object):
             self.json_output = data
             return True
         return False
-            
-    def search(self):
-        self.index = 'main'
-        if not self.cacheCheck():
-            if self.query == "ALL":
-                self.query = ""
-            self.setLimit(100)
-            self.getSubreddits('id', 'data')
-            for res in self.matches:
-                print res
-                query = "SELECT id,json FROM _raw WHERE id=%s" % (res['id'])
-                results = self.cur.execute(query)
-                row = self.cur.fetchone()
-                self.json_output['data'].append(json.loads(zlib.decompress(row[1])))
-            self.cache()
-            self.json_output = self.json_output
-        return json.dumps(self.json_output)
-        
+   
     def cache(self):
         time = int(3600 * (self.search_time / 5))
         self.json_output["debug"]["cache_time"] = 300 if time < 300 else time
@@ -136,29 +119,42 @@ class Query(object):
             addon = " WHERE subreddit_id IN (%s)" % ','.join(["'%s'" % x for x in subreddits]) if len(subreddits) > 0 else '' 
             addon = addon + limit
             query = "SELECT %s FROM %s%s" % (id, table, addon)
-            print query
             results = self.cur.execute(query)
-            row = self.cur.fetchone()
-            while row:
-                self.matches.append({'id':row[0]})
-                row = self.cur.fetchone()
-                
+            rows = self.cur.fetchallDict()
+            self.matches.extend(rows)
+
+    def search(self):
+        self.index = 'main'
+        if not self.cacheCheck():
+            if self.query == "ALL":
+                self.query = ""
+            self.setLimit(100)
+            self.getSubreddits('id', 'data')
+
+            ids = ','.join([str(int(x['id'])) for x in self.matches])
+            query = "SELECT id,json FROM _raw WHERE id IN (%s)" % (ids)
+            print ids
+            results = self.cur.execute(query)
+            rows = self.cur.fetchallDict()
+            for row in rows:
+                self.json_output['data'].append(json.loads(zlib.decompress(row['json'])))
+        self.cache()
+        return self.output()
+                    
     def searchComments(self):
         self.index = 'comments'
         
         if not self.cacheCheck():
             self.setLimit(500)
             self.getSubreddits('comment_id', 'comments_index')
-            for match in self.matches:
-                if match is None:
-                    break
-                query = "SELECT json FROM comments WHERE comment_id=%s" % (match['id'])
-                results = self.cur.execute(query)
-                row = self.cur.fetchone()
-                if row is not None:
-                    self.json_output['data'].append(json.loads(zlib.decompress(row[0])))
+            ids = ','.join([str(int(x['comment_id'])) for x in self.matches])
+            query = "SELECT json FROM comments WHERE comment_id IN (%s)" % (ids)
+            results = self.cur.execute(query)
+            rows = self.cur.fetchallDict()
+            for row in rows:
+                self.json_output['data'].append(json.loads(zlib.decompress(row["json"])))
         self.cache()
-        return json.dumps(self.json_output)
+        return self.output()
         
         
     def setLimit(self, limit):
@@ -176,7 +172,6 @@ class Query(object):
         self.cl.SetSortMode(SPH_SORT_EXTENDED, "score DESC")
         self.cl.SetFilterRange('date', self.fromtime, self.totime)
         self.getSubreddits('id', 'data')
-        print self.matches
         for res in self.matches[:25]:
             print "Got here"
             query = "SELECT id,json FROM _raw WHERE id=%s" % (res['id'])
