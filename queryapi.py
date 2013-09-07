@@ -19,6 +19,8 @@ limit = 100
 query = ""
 class Query(object):
     def __init__(self, query="ALL", operation="search", limit=5, sort="date", subreddit="", fromtime=0, totime=1914975401):
+        self.start_time = time.clock()
+        print "Start Time: %s" % self.start_time
         self.memcache = memcache.Client(['127.0.0.1:11211'], debug=0)
         self.user = login_info.user
         self.password = login_info.password
@@ -52,9 +54,10 @@ class Query(object):
             self.searchComments()
         if operation == 'topsubs':
             self.getTopSubmissions()
-            
+        if operation == 'activethreads':
+            self.getMostActiveThreads()
     def connectMySQL(self):
-        self.con = MySQLdb.connect('localhost', self.user, self.password, 'reddit')
+        self.con = MySQLdb.connect('localhost', self.user, self.password, 'reddit', charset='utf8')
         self.cur = self.con.cursor(MySQLdb.cursors.DictCursor)
         
     def sphinxConnect(self):
@@ -101,6 +104,7 @@ class Query(object):
         self.memcache.set(self.key, self.json_output, time)
         
     def output(self):
+        self.json_output['debug']['debug_time'] = time.clock() - self.start_time
         return json.dumps(self.json_output)
     
     def getSubreddits(self, id, table):
@@ -173,10 +177,10 @@ class Query(object):
         GROUP BY comments_index.link_id
         ORDER BY count(*) DESC
         LIMIT %s
-        """ % (300,25)
+        """ % (300, 25)
         self.cur.execute(self.dbquery)
         self.json_output['data'] += self.cur.fetchallDict()
-        print json.dumps(self.json_output)
+        return self.output()
 
     def getTopSubmissions(self):
         self.index = "main"
@@ -195,4 +199,4 @@ class Query(object):
             self.json_output['data'].append(json.loads(zlib.decompress(row[1])))
         self.cache()
         self.json_output = self.json_output
-        return json.dumps(self.json_output)
+        return self.output()
